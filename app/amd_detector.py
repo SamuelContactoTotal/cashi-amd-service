@@ -1,0 +1,216 @@
+"""
+AMD Detector - Deteccion de Buzon de Voz usando Vosk
+"""
+import json
+import logging
+from vosk import Model, KaldiRecognizer
+from app.config import (
+    VOSK_MODEL_PATH,
+    VOICEMAIL_KEYWORDS,
+    AMD_MIN_SPEECH_FOR_MACHINE
+)
+
+logger = logging.getLogger(__name__)
+
+class AMDDetector:
+    """
+    Detector de Maquina Contestadora (AMD)
+    Usa Vosk para transcribir audio y detectar si es humano o maquina
+    """
+
+    def __init__(self):
+        logger.info(f"Cargando modelo Vosk desde: {VOSK_MODEL_PATH}")
+        self.model = Model(VOSK_MODEL_PATH)
+        logger.info("Modelo Vosk cargado exitosamente")
+
+    def create_recognizer(self, sample_rate: int = 8000) -> KaldiRecognizer:
+        """Crea un nuevo recognizer para una llamada"""
+        return KaldiRecognizer(self.model, sample_rate)
+
+    def analyze_transcription(self, text: str, speech_duration: float = 0) -> dict:
+        """
+        Analiza el texto transcrito para determinar si es humano o maquina
+
+        Args:
+            text: Texto transcrito del audio
+            speech_duration: Duracion del habla en segundos
+
+        Returns:
+            dict con resultado: HUMAN, MACHINE, o UNKNOWN
+        """
+        text_lower = text.lower().strip()
+
+        logger.info(f"Analizando: '{text_lower}' (duracion habla: {speech_duration:.2f}s)")
+
+        # Si no hay texto, es desconocido
+        if not text_lower:
+            return {
+                "result": "UNKNOWN",
+                "confidence": 0.0,
+                "reason": "No se detecto habla",
+                "transcription": ""
+            }
+
+        # Contar palabras clave de buzon
+        keywords_found = []
+        for keyword in VOICEMAIL_KEYWORDS:
+            if keyword in text_lower:
+                keywords_found.append(keyword)
+
+        # REGLA 1: Si encontro palabras clave de buzon = MAQUINA
+        if len(keywords_found) >= 1:
+            confidence = min(0.95, 0.7 + (len(keywords_found) * 0.1))
+            return {
+                "result": "MACHINE",
+                "confidence": confidence,
+                "reason": f"Palabras clave detectadas: {keywords_found}",
+                "transcription": text_lower,
+                "keywords": keywords_found
+            }
+
+        # REGLA 2: Si habla mucho tiempo continuo sin pausas = MAQUINA
+        if speech_duration > AMD_MIN_SPEECH_FOR_MACHINE:
+            # Contar palabras - un buzon tipicamente tiene muchas palabras
+            word_count = len(text_lower.split())
+            if word_count > 8:  # Mas de 8 palabras en los primeros segundos
+                return {
+                    "result": "MACHINE",
+                    "confidence": 0.75,
+                    "reason": f"Habla continua larga ({speech_duration:.1f}s, {word_count} palabras)",
+                    "transcription": text_lower
+                }
+
+        # REGLA 3: Respuesta corta tipica de humano ("alo", "hola", "si", "digame")
+        human_greetings = ["alo", "aló", "hola", "si", "sí", "diga", "digame", "dígame",
+                          "bueno", "quien", "quién", "mande"]
+
+        words = text_lower.split()
+        if len(words) <= 3:
+            for greeting in human_greetings:
+                if greeting in text_lower:
+                    return {
+                        "result": "HUMAN",
+                        "confidence": 0.85,
+                        "reason": f"Saludo humano detectado: '{text_lower}'",
+                        "transcription": text_lower
+                    }
+
+        # REGLA 4: Si es corto y no tiene keywords de buzon = probablemente humano
+        if len(words) <= 4 and len(keywords_found) == 0:
+            return {
+                "result": "HUMAN",
+                "confidence": 0.70,
+                "reason": "Respuesta corta sin indicadores de buzon",
+                "transcription": text_lower
+            }
+
+        # Default: Si no podemos determinar con confianza
+        return {
+            "result": "UNKNOWN",
+            "confidence": 0.5,
+            "reason": "No se pudo determinar con certeza",
+            "transcription": text_lower
+        }
+
+
+class AMDSession:
+    """
+    Sesion AMD para una llamada individual
+    Acumula audio y toma decision
+    """
+
+    def __init__(self, detector: AMDDetector, call_id: str, sample_rate: int = 8000):
+        self.detector = detector
+        self.call_id = call_id
+        self.sample_rate = sample_rate
+        self.recognizer = detector.create_recognizer(sample_rate)
+        self.accumulated_text = ""
+        self.speech_start_time = None
+        self.total_speech_duration = 0.0
+        self.decision_made = False
+        self.final_result = None
+
+    def process_audio(self, audio_data: bytes) -> dict | None:
+        """
+        Procesa un chunk de audio
+
+        Returns:
+            dict con resultado si se tomo una decision, None si necesita mas audio
+        """
+        if self.decision_made:
+            return self.final_result
+
+        # Alimentar audio al recognizer
+        if self.recognizer.AcceptWaveform(audio_data):
+            # Resultado parcial completo
+            result = json.loads(self.recognizer.Result())
+            text = result.get("text", "")
+
+            if text:
+                self.accumulated_text += " " + text
+                self.total_speech_duration += len(audio_data) / (self.sample_rate * 2)  # 16-bit = 2 bytes
+
+                # Analizar lo que tenemos hasta ahora
+                analysis = self.detector.analyze_transcription(
+                    self.accumulated_text.strip(),
+                    self.total_speech_duration
+                )
+
+                # Si tenemos alta confianza, tomar decision
+                if analysis["confidence"] >= 0.70:
+                    self.decision_made = True
+                    self.final_result = {
+                        "call_id": self.call_id,
+                        **analysis
+                    }
+                    logger.info(f"[{self.call_id}] Decision: {self.final_result}")
+                    return self.final_result
+        else:
+            # Resultado parcial (en progreso)
+            partial = json.loads(self.recognizer.PartialResult())
+            partial_text = partial.get("partial", "")
+
+            # Analisis rapido del parcial para detectar buzones obvios
+            if partial_text:
+                quick_analysis = self.detector.analyze_transcription(partial_text, 0)
+                if quick_analysis["result"] == "MACHINE" and quick_analysis["confidence"] >= 0.85:
+                    self.decision_made = True
+                    self.final_result = {
+                        "call_id": self.call_id,
+                        **quick_analysis,
+                        "partial": True
+                    }
+                    logger.info(f"[{self.call_id}] Decision rapida: {self.final_result}")
+                    return self.final_result
+
+        return None
+
+    def force_decision(self) -> dict:
+        """
+        Fuerza una decision con lo que se tiene (timeout)
+        """
+        if self.decision_made:
+            return self.final_result
+
+        # Obtener texto final
+        final = json.loads(self.recognizer.FinalResult())
+        final_text = final.get("text", "")
+
+        if final_text:
+            self.accumulated_text += " " + final_text
+
+        # Analizar todo lo acumulado
+        analysis = self.detector.analyze_transcription(
+            self.accumulated_text.strip(),
+            self.total_speech_duration
+        )
+
+        self.decision_made = True
+        self.final_result = {
+            "call_id": self.call_id,
+            **analysis,
+            "forced": True
+        }
+
+        logger.info(f"[{self.call_id}] Decision forzada: {self.final_result}")
+        return self.final_result
